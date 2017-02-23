@@ -25,7 +25,7 @@ if __name__ == '__main__':
     sqs_connection, sqs_queue = queue.create_queue()
     sns_connection, subscription_arn = queue.subscribe_sns(sqs_queue)
     while True:
-        if queue.poll_queue(sns_connection, sqs_queue) \
+        if queue.poll_queue(sqs_connection, sqs_queue) \
                 or metadata.poll_instance_metadata():
             queue.clean_up_sns(sns_connection, subscription_arn, sqs_queue)
             requests.get(CONFIG["endpoint"])
