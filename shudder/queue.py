@@ -18,8 +18,8 @@ impending doom.
 
 """
 import json
-
 import boto3
+import hashlib
 
 from shudder.config import CONFIG
 import shudder.metadata as metadata
@@ -41,6 +41,31 @@ def create_queue():
 
 
 def subscribe_sns(queue):
+    """Attach a policy to allow incoming connections from SNS"""
+    statement_id = hashlib.md5((CONFIG['sns_topic'] +  queue.attributes.get('QueueArn')).encode('utf-8')).hexdigest()
+    statement_id_exists = False
+    existing_policy = queue.attributes.get('Policy')
+    if existing_policy: 
+        policy = json.loads(existing_policy)
+    else:
+        policy = {}
+    if 'Version' not in policy:
+        policy['Version'] = '2008-10-17'
+    if 'Statement' not in policy:
+        policy['Statement'] = []
+    # See if a Statement with the Sid exists already.
+    for statement in policy['Statement']:
+        if statement['Sid'] == statement_id:
+           statement_id_exists = True
+    if not statement_id_exists:
+        statement = {'Action': 'SQS:SendMessage',
+            'Effect': 'Allow',
+            'Principal': {'AWS': '*'},
+            'Resource': queue.attributes.get('QueueArn'),
+            'Sid': statement_id,
+            'Condition': {"ForAllValues:ArnEquals":{"aws:SourceArn":CONFIG['sns_topic']}}}
+        policy['Statement'].append(statement)
+    queue.set_attributes(Attributes={'Policy':json.dumps(policy)})
     """Subscribes the SNS topic to the queue."""
     conn = boto3.client('sns', region_name=CONFIG['region'])
     sub = conn.subscribe(TopicArn=CONFIG['sns_topic'], Protocol='sqs', Endpoint=queue.attributes.get('QueueArn'))
@@ -51,16 +76,39 @@ def subscribe_sns(queue):
 def should_terminate(msg):
     """Check if the termination message is about our instance"""
     first_box = json.loads(msg.body)
-    body = json.loads(first_box['Message'])
+    message = json.loads(first_box['Message'])
     termination_msg = 'autoscaling:EC2_INSTANCE_TERMINATING'
-    return body.get('LifecycleTransition') == termination_msg \
-        and INSTANCE_ID == body['EC2InstanceId']
 
+    if message['LifecycleTransition'] == termination_msg and INSTANCE_ID == message['EC2InstanceId']:
+        return message
+    else:
+        return None
 
 def clean_up_sns(sns_conn, sns_arn, queue):
     """Clean up SNS subscription and SQS queue"""
     queue.delete()
     sns_conn.unsubscribe(SubscriptionArn=sns_arn)
+
+
+def record_lifecycle_action_heartbeat(message):
+    """Let AWS know we're still in the process of shutting down"""
+    conn = boto3.client('autoscaling', region_name=CONFIG['region'])
+    conn.record_lifecycle_action_heartbeat(
+        LifecycleHookName=message['LifecycleHookName'],
+        AutoScalingGroupName=message['AutoScalingGroupName'],
+        LifecycleActionToken=message['LifecycleActionToken'],
+        InstanceId=message['EC2InstanceId'])
+
+
+def complete_lifecycle_action(message):
+    """Let AWS know it's safe to terminate the instance now"""
+    conn = boto3.client('autoscaling', region_name=CONFIG['region'])
+    conn.complete_lifecycle_action(
+        LifecycleHookName=message['LifecycleHookName'],
+        AutoScalingGroupName=message['AutoScalingGroupName'],
+        LifecycleActionToken=message['LifecycleActionToken'],
+        LifecycleActionResult='CONTINUE',
+        InstanceId=message['EC2InstanceId'])
 
 
 def poll_queue(conn, queue):
